@@ -1,5 +1,5 @@
 flask>=3.0
-openai>=1.106
+openai>=1.107
 azure-identity>=1.19
 azure-search-documents>=11.6
 gunicorn>=23.0

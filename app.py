@@ -4,6 +4,9 @@ Een kleine Flask-app die een Foundry-model aanroept via de Responses API,
 met de managed identity van de host (App Service of Container Apps). Geen API-sleutels.
 Dag 3 voegt RAG toe: de app zoekt eerst in een Azure AI Search-index (hybride +
 semantisch) en laat het model antwoorden op basis van die bronnen, met bronvermelding.
+Dag 4 voegt twee dingen toe: (1) een pagina /agent die een prompt agent in Foundry Agent
+Service aanroept, en (2) een kleine 'gemeente-API' (/api/...) met een OpenAPI-beschrijving
+(/openapi.json) die de agent als tool kan gebruiken.
 
 Instellingen (App Service: Environment variables / Container Apps: Environment variables):
   AZURE_OPENAI_ENDPOINT        https://<foundry-resource>.openai.azure.com/openai/v1/
@@ -13,6 +16,9 @@ Instellingen (App Service: Environment variables / Container Apps: Environment v
   AZURE_SEARCH_SEMANTIC_CONFIG (optioneel) standaard <index>-semantic-configuration
   RAG_TOP                      (optioneel) aantal bronnen, standaard 5
   APP_VERSION                  (optioneel) label dat bovenin de pagina staat, bijv. v1 / v2
+  FOUNDRY_PROJECT_ENDPOINT     https://<foundry>.services.ai.azure.com/api/projects/<project>  (dag 4)
+  AGENT_NAME                   naam van de prompt agent in Foundry, bijv. voorbeeldstad-assistent (dag 4)
+  PUBLIC_BASE_URL              (optioneel) publieke https-URL van deze app voor /openapi.json
   TOKEN_SCOPE                  (optioneel) standaard https://cognitiveservices.azure.com/.default
 """
 
@@ -20,9 +26,16 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, render_template_string, request
+import datetime as dt
+import hashlib
+
+from flask import Flask, jsonify, render_template_string, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
+# Achter App Service / Container Apps-ingress komt HTTPS binnen als HTTP; ProxyFix leest
+# X-Forwarded-Proto/Host zodat /openapi.json de juiste https-URL noemt.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 SCOPE = os.environ.get("TOKEN_SCOPE", "https://cognitiveservices.azure.com/.default")
 EFFORTS = ["standaard", "low", "medium", "high"]
@@ -254,6 +267,199 @@ def rag_answer(deployment: str, question: str, effort: str = "standaard") -> dic
     return result
 
 
+# ---------------------------------------------------------------- dag 4: agent
+AGENT_SCOPE = "https://ai.azure.com/.default"
+
+
+def project_endpoint() -> str:
+    return os.environ.get("FOUNDRY_PROJECT_ENDPOINT", "").strip().rstrip("/")
+
+
+def agent_name() -> str:
+    return os.environ.get("AGENT_NAME", "").strip()
+
+
+def agent_configured() -> bool:
+    return bool(project_endpoint() and agent_name())
+
+
+_agent_token_provider = None
+
+
+def get_agent_client():
+    """OpenAI-client op het PROJECT-endpoint (niet het model-endpoint), met scope ai.azure.com."""
+    global _agent_token_provider
+    from openai import OpenAI
+    if _agent_token_provider is None:
+        from azure.identity import get_bearer_token_provider
+        _agent_token_provider = get_bearer_token_provider(credential(), AGENT_SCOPE)
+    return OpenAI(base_url=project_endpoint() + "/openai/v1/", api_key=_agent_token_provider, max_retries=2)
+
+
+def explain_agent_error(exc: Exception) -> dict:
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if name in ("CredentialUnavailableError", "ClientAuthenticationError") or "DefaultAzureCredential" in str(exc):
+        hint = "Geen identiteit gevonden. Staat de managed identity van deze app aan?"
+    elif status in (401, 403):
+        hint = ("Geen toegang tot de agent. De managed identity van deze app heeft op het Foundry-PROJECT "
+                "(of op de agent) de rol 'Foundry Agent Consumer' nodig (of 'Foundry User'). "
+                "'Cognitive Services OpenAI User' is hier niet genoeg: agents zijn een projectfunctie. "
+                "Na toekennen 5-10 minuten wachten en de app herstarten.")
+    elif status == 404:
+        hint = ("Niet gevonden. Klopt AGENT_NAME (hoofdlettergevoelig) en eindigt FOUNDRY_PROJECT_ENDPOINT op "
+                "/api/projects/<projectnaam>?")
+    elif status == 429:
+        hint = "Rate limit: het model achter de agent zit aan zijn TPM-quota. Wacht even of verhoog de TPM."
+    elif status == 400:
+        hint = ("Ongeldig verzoek. Vaak een tool die niet werkt (bijv. een OpenAPI-tool met een verkeerde "
+                "server-URL) of een verlopen gesprek. Start een nieuw gesprek.")
+    elif name == "APIConnectionError":
+        hint = "Project-endpoint onbereikbaar. Klopt FOUNDRY_PROJECT_ENDPOINT?"
+    else:
+        hint = "Onverwachte fout bij de agent, zie de melding."
+    return {"type": name, "status": status, "retry_after": None, "hint": hint,
+            "message": str(exc)[:600], "stage": "agent (Foundry Agent Service)"}
+
+
+def describe_output(resp) -> list:
+    """Welke stappen zette de agent? (tool-aanroepen, berichten) - handig om te leren wat er gebeurt."""
+    steps = []
+    for item in getattr(resp, "output", None) or []:
+        kind = getattr(item, "type", "?")
+        if kind == "message":
+            continue
+        label = (getattr(item, "name", None) or getattr(item, "server_label", None)
+                 or getattr(item, "tool_name", None) or "")
+        status = getattr(item, "status", None) or ""
+        steps.append({"type": kind, "label": label, "status": status})
+    return steps
+
+
+def ask_agent(question: str, conversation_id: str = "") -> dict:
+    start = time.perf_counter()
+    try:
+        client = get_agent_client()
+        if not conversation_id:
+            conversation_id = client.conversations.create().id
+        resp = client.responses.create(
+            conversation=conversation_id,
+            input=question,
+            extra_body={"agent_reference": {"name": agent_name(), "type": "agent_reference"}},
+        )
+        return {"ok": True, "text": resp.output_text, "model": getattr(resp, "model", None),
+                "usage": usage_dict(resp), "steps": describe_output(resp),
+                "conversation": conversation_id, "seconds": round(time.perf_counter() - start, 2)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": explain_agent_error(exc), "conversation": conversation_id,
+                "seconds": round(time.perf_counter() - start, 2)}
+
+
+# ---------------------------------------------------------------- dag 4: gemeente-API (tool)
+# Fictieve, openbare gegevens van gemeente Voorbeeldstad. Bewust zonder persoonsgegevens:
+# deze API heeft geen authenticatie nodig (anonymous OpenAPI-tool).
+WEEKDAGEN = ["maandag", "dinsdag", "woensdag", "donderdag", "vrijdag", "zaterdag", "zondag"]
+
+
+def _seed(text: str) -> int:
+    return int(hashlib.sha256(text.encode()).hexdigest(), 16)
+
+
+def normalize_postcode(pc: str) -> str:
+    pc = (pc or "").replace(" ", "").upper()
+    if len(pc) == 6 and pc[:4].isdigit() and pc[4:].isalpha():
+        return pc
+    return ""
+
+
+def afvalkalender(postcode: str, today: dt.date | None = None) -> dict:
+    today = today or dt.date.today()
+    seed = _seed(postcode)
+    weekday = seed % 5                       # vaste ophaaldag per postcode (ma-vr)
+    week_parity = (seed // 5) % 2            # restafval: even of oneven weken
+
+    def next_on(weekday_: int, every_weeks: int, parity: int = 0) -> dt.date:
+        d = today + dt.timedelta(days=1)
+        while True:
+            if d.weekday() == weekday_ and (every_weeks == 1 or d.isocalendar()[1] % every_weeks == parity):
+                return d
+            d += dt.timedelta(days=1)
+
+    gft_every = 1 if 4 <= today.month <= 10 else 2
+    grofvuil, werkdagen = today, 0          # minimaal 3 werkdagen vooruit (aanmeldtermijn)
+    while werkdagen < 3:
+        grofvuil += dt.timedelta(days=1)
+        werkdagen += grofvuil.weekday() < 5
+    while grofvuil.weekday() != (weekday + 2) % 5:
+        grofvuil += dt.timedelta(days=1)
+    fmt = lambda d: {"datum": d.isoformat(), "dag": WEEKDAGEN[d.weekday()]}  # noqa: E731
+    return {
+        "postcode": postcode,
+        "restafval": fmt(next_on(weekday, 2, week_parity)),
+        "gft": fmt(next_on(weekday, gft_every, week_parity)),
+        "papier": fmt(next_on((weekday + 1) % 5, 4, week_parity % 4)),
+        "eerstvolgende_grofvuil_ophaalmoment": fmt(grofvuil),
+        "opmerking": "Grofvuil minimaal 3 werkdagen vooraf aanmelden; 4 keer per jaar gratis (max. 2 m3).",
+        "bron": "Fictieve afvalkalender Voorbeeldstad (lab)",
+    }
+
+
+STATUSSEN = [
+    ("ontvangen", "De aanvraag is ontvangen en wacht op beoordeling."),
+    ("in behandeling", "Een medewerker beoordeelt de aanvraag."),
+    ("aanvullende informatie nodig", "De gemeente wacht op aanvullende stukken van de aanvrager."),
+    ("besluit genomen", "Er is een besluit genomen; de aanvrager ontvangt dit per post en in MijnVoorbeeldstad."),
+]
+SOORTEN = ["bewonersparkeervergunning", "subsidie duurzaam wonen", "melding grofvuil", "mantelzorgvergunning"]
+
+
+def zaak(zaaknummer: str, today: dt.date | None = None):
+    today = today or dt.date.today()
+    nr = (zaaknummer or "").strip().upper()
+    parts = nr.split("-")
+    if len(parts) != 3 or parts[0] != "VBS" or not parts[1].isdigit() or not parts[2].isdigit():
+        return None
+    seed = _seed(nr)
+    ingediend = today - dt.timedelta(days=3 + seed % 50)
+    status, uitleg = STATUSSEN[seed % len(STATUSSEN)]
+    return {
+        "zaaknummer": nr,
+        "soort": SOORTEN[(seed // 7) % len(SOORTEN)],
+        "ingediend_op": ingediend.isoformat(),
+        "status": status,
+        "toelichting": uitleg,
+        "uiterste_beslisdatum": (ingediend + dt.timedelta(weeks=8)).isoformat(),
+        "bron": "Fictief zaaksysteem Voorbeeldstad (lab); bevat bewust geen persoonsgegevens",
+    }
+
+
+def openapi_spec(base_url: str) -> dict:
+    return {
+        "openapi": "3.0.3",
+        "info": {"title": "Gemeente Voorbeeldstad API (lab)", "version": "1.0.0",
+                 "description": "Fictieve, openbare gegevens van gemeente Voorbeeldstad: afvalkalender en status van aanvragen."},
+        "servers": [{"url": base_url.rstrip("/")}],
+        "paths": {
+            "/api/afvalkalender": {"get": {
+                "operationId": "getAfvalkalender",
+                "summary": "Eerstvolgende ophaaldagen van afval voor een postcode",
+                "description": "Geeft de eerstvolgende ophaaldatum voor restafval, gft en papier, en het eerstvolgende moment om grofvuil te laten ophalen.",
+                "parameters": [{"name": "postcode", "in": "query", "required": True,
+                                "description": "Nederlandse postcode, bijv. 1234AB", "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "Afvalkalender", "content": {"application/json": {"schema": {"type": "object"}}}},
+                              "400": {"description": "Ongeldige postcode"}}}},
+            "/api/aanvragen/{zaaknummer}": {"get": {
+                "operationId": "getAanvraagStatus",
+                "summary": "Status van een aanvraag opvragen met het zaaknummer",
+                "description": "Zaaknummers hebben de vorm VBS-2026-1234. Geeft soort aanvraag, status en uiterste beslisdatum.",
+                "parameters": [{"name": "zaaknummer", "in": "path", "required": True,
+                                "description": "Zaaknummer, bijv. VBS-2026-1234", "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "Status", "content": {"application/json": {"schema": {"type": "object"}}}},
+                              "404": {"description": "Onbekend zaaknummer"}}}},
+        },
+    }
+
+
 def hosting() -> str:
     if os.environ.get("CONTAINER_APP_NAME"):
         rev = os.environ.get("CONTAINER_APP_REVISION", "?")
@@ -282,7 +488,7 @@ PAGE = """<!doctype html>
 </style></head><body>
 <h1>AI-lab chat</h1>
 <p class="sub">{{ host }} &rarr; managed identity &rarr; Foundry{% if rag_ok %} + AI Search{% endif %}. Geen sleutels. <span class="badge">{{ version }}</span></p>
-<nav><a href="/">Chat</a><a href="/info">Info</a><a href="/stress">Rate-limit test</a><a href="/health">Health</a></nav>
+<nav><a href="/">Chat</a><a href="/agent">Agent</a><a href="/info">Info</a><a href="/stress">Rate-limit test</a><a href="/openapi.json">API</a><a href="/health">Health</a></nav>
 {% if not configured %}
 <div class="card err"><b>Niet geconfigureerd.</b> Zet de app setting <code>AZURE_OPENAI_ENDPOINT</code> (en <code>MODEL_DEPLOYMENTS</code>).</div>
 {% endif %}
@@ -321,6 +527,47 @@ PAGE = """<!doctype html>
  <div class="card err"><b>{{ result.error.type }}{% if result.error.status %} (HTTP {{ result.error.status }}){% endif %}{% if result.error.stage %} bij {{ result.error.stage }}{% endif %}</b>
   <p>{{ result.error.hint }}</p>{% if result.error.retry_after %}<p>Retry-After: {{ result.error.retry_after }}</p>{% endif %}
   <p class="muted">{{ result.error.message }}</p></div>
+ {% endif %}
+{% endif %}
+</body></html>"""
+
+AGENT_PAGE = """<!doctype html>
+<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI-lab agent</title>
+<style>
+ body{font-family:Segoe UI,system-ui,sans-serif;max-width:860px;margin:24px auto;padding:0 16px;color:#201f1e;background:#faf9f8}
+ h1{font-size:1.5rem;margin:0 0 4px} .sub{color:#605e5c;margin:0 0 18px} nav a{margin-right:14px;color:#0067b8}
+ form,.card{background:#fff;border:1px solid #e1dfdd;border-radius:6px;padding:16px;margin:14px 0}
+ textarea{width:100%;box-sizing:border-box;font:inherit;padding:8px;border:1px solid #c8c6c4;border-radius:4px}
+ button{margin-top:12px;background:#0067b8;color:#fff;border:0;border-radius:4px;padding:9px 18px;font:inherit;cursor:pointer}
+ button.alt{background:#fff;color:#0067b8;border:1px solid #0067b8;margin-left:8px}
+ .answer{white-space:pre-wrap} .err{border-color:#d13438;background:#fdf3f4} .muted{color:#605e5c;font-size:.9rem}
+ td,th{border-bottom:1px solid #edebe9;text-align:left;padding:6px 4px;font-size:.92rem} table{border-collapse:collapse;width:100%}
+ code{background:#f3f2f1;padding:1px 4px;border-radius:3px} .badge{background:#0067b8;color:#fff;border-radius:10px;padding:1px 9px;font-size:.8rem}
+</style></head><body>
+<h1>Agent: {{ agent or "(niet ingesteld)" }}</h1>
+<p class="sub">{{ host }} &rarr; managed identity &rarr; Foundry Agent Service &rarr; tools (knowledge base, gemeente-API). <span class="badge">{{ version }}</span></p>
+<nav><a href="/">Chat</a><a href="/agent">Agent</a><a href="/info">Info</a><a href="/openapi.json">API</a></nav>
+{% if not configured %}<div class="card err"><b>Niet geconfigureerd.</b> Zet <code>FOUNDRY_PROJECT_ENDPOINT</code> en <code>AGENT_NAME</code>.</div>{% endif %}
+<form method="post" action="/agent">
+ <input type="hidden" name="conversation" value="{{ conversation }}">
+ <label for="q"><b>Vraag aan de agent</b></label>
+ <textarea id="q" name="q" rows="4" required>{{ q }}</textarea>
+ <button type="submit">Verstuur</button><button class="alt" type="submit" name="new" value="1" formnovalidate>Nieuw gesprek</button>
+ <p class="muted">{% if conversation %}Gesprek: <code>{{ conversation }}</code> (vervolgvragen onthouden de context){% else %}Nog geen gesprek; de eerste vraag start er een.{% endif %}</p>
+</form>
+{% if result %}
+ {% if result.ok %}
+ <div class="card"><div class="answer">{{ result.text }}</div></div>
+ <div class="card"><b>Wat deed de agent?</b>
+  {% if result.steps %}<table><tr><th>Stap (output item)</th><th>Tool / server</th><th>Status</th></tr>
+  {% for st in result.steps %}<tr><td><code>{{ st.type }}</code></td><td>{{ st.label }}</td><td>{{ st.status }}</td></tr>{% endfor %}</table>
+  {% else %}<p class="muted">Geen tool-aanroepen: de agent antwoordde direct.</p>{% endif %}
+  <p class="muted">Tijd {{ result.seconds }} s &middot; model {{ result.model }} &middot; input {{ result.usage.input }} / output {{ result.usage.output }} tokens.
+  Tool-resultaten tellen mee als input tokens.</p></div>
+ {% else %}
+ <div class="card err"><b>{{ result.error.type }}{% if result.error.status %} (HTTP {{ result.error.status }}){% endif %} bij {{ result.error.stage }}</b>
+  <p>{{ result.error.hint }}</p><p class="muted">{{ result.error.message }}</p></div>
  {% endif %}
 {% endif %}
 </body></html>"""
@@ -385,6 +632,9 @@ def info():
         ("Search-endpoint", search_endpoint() or "(niet ingesteld)"),
         ("Search-index", search_index() or "(niet ingesteld)"),
         ("Semantische configuratie", semantic_config() if rag_configured() else "(n.v.t.)"),
+        ("Foundry-project (agents)", project_endpoint() or "(niet ingesteld)"),
+        ("Agent", agent_name() or "(niet ingesteld)"),
+        ("OpenAPI-beschrijving voor tools", request.host_url.rstrip("/") + "/openapi.json"),
         ("Ingelogde gebruiker (Easy Auth)", request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "(geen: authenticatie staat uit)")),
     ]
     return render_template_string(INFO, rows=rows)
@@ -409,10 +659,49 @@ def stress():
                                   ok=ok, throttled=throttled, other=len(results) - ok - throttled)
 
 
+@app.route("/agent", methods=["GET", "POST"])
+def agent_page():
+    q = request.form.get("q", "")
+    conversation = request.form.get("conversation", "")
+    result = None
+    if request.method == "POST":
+        if request.form.get("new"):
+            conversation, q = "", ""
+        elif q.strip() and agent_configured():
+            result = ask_agent(q.strip(), conversation)
+            conversation = result.get("conversation") or ""
+    return render_template_string(AGENT_PAGE, agent=agent_name(), host=hosting(),
+                                  version=os.environ.get("APP_VERSION", "v1"),
+                                  configured=agent_configured(), q=q, conversation=conversation, result=result)
+
+
+@app.route("/api/afvalkalender")
+def api_afvalkalender():
+    pc = normalize_postcode(request.args.get("postcode", ""))
+    if not pc:
+        return jsonify({"fout": "Geef een geldige postcode, bijv. 1234AB."}), 400
+    return jsonify(afvalkalender(pc))
+
+
+@app.route("/api/aanvragen/<zaaknummer>")
+def api_aanvraag(zaaknummer):
+    data = zaak(zaaknummer)
+    if data is None:
+        return jsonify({"fout": "Onbekend zaaknummer. Verwacht formaat: VBS-2026-1234."}), 404
+    return jsonify(data)
+
+
+@app.route("/openapi.json")
+def api_openapi():
+    base = os.environ.get("PUBLIC_BASE_URL", "").strip() or request.host_url
+    return jsonify(openapi_spec(base))
+
+
 @app.route("/health")
 def health():
     return {"status": "ok", "configured": bool(endpoint()), "rag": rag_configured(),
-            "version": os.environ.get("APP_VERSION", "v1"), "hosting": hosting()}
+            "version": os.environ.get("APP_VERSION", "v1"), "hosting": hosting(),
+            "agent": agent_configured()}
 
 
 if __name__ == "__main__":

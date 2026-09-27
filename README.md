@@ -6,6 +6,8 @@ configuratie, dus deze repo mag openbaar zijn.
 
 - **Dag 2**: draait op Azure App Service (code-deploy).
 - **Dag 3**: RAG met Azure AI Search, en dezelfde code als container op Azure Container Apps.
+- **Dag 4**: pagina `/agent` die een prompt agent in Foundry Agent Service aanroept, en een kleine
+  fictieve gemeente-API (`/api/...` + `/openapi.json`) die de agent als OpenAPI-tool gebruikt.
 
 ## Instellingen (environment variables)
 
@@ -18,6 +20,9 @@ configuratie, dus deze repo mag openbaar zijn.
 | `AZURE_SEARCH_INDEX` | `beleid` | dag 3 |
 | `AZURE_SEARCH_SEMANTIC_CONFIG` | optioneel, standaard `<index>-semantic-configuration` | dag 3 |
 | `APP_VERSION` | `v1` of `v2` (label bovenin, voor traffic splitting) | dag 3 |
+| `FOUNDRY_PROJECT_ENDPOINT` | `https://<foundry>.services.ai.azure.com/api/projects/proj-ailab` | dag 4 |
+| `AGENT_NAME` | `voorbeeldstad-assistent` | dag 4 |
+| `PUBLIC_BASE_URL` | optioneel: publieke https-URL voor `/openapi.json` | dag 4 |
 
 ## Rechten voor de managed identity van de app
 
@@ -26,11 +31,15 @@ configuratie, dus deze repo mag openbaar zijn.
 | Cognitive Services OpenAI User | Foundry-resource | het model aanroepen |
 | Search Index Data Reader | Search-service | de index doorzoeken (dag 3) |
 | AcrPull | Container registry | image ophalen (alleen Container Apps; zet het portal zelf) |
+| Foundry Agent Consumer | Foundry-project | de agent aanroepen (dag 4) |
 
 ## Pagina's
 
 - `/`: chat. Kies het model, de reasoning effort en de bron: alleen het model, of je documenten (RAG, met bronnen en scores)
 - `/info`: configuratie, hosting en identiteit (zonder geheimen)
+- `/agent`: gesprek met de Foundry-agent, met de tool-aanroepen per antwoord (dag 4)
+- `/api/afvalkalender?postcode=1234AB` en `/api/aanvragen/VBS-2026-1234`: fictieve gemeente-API (dag 4)
+- `/openapi.json`: OpenAPI 3-beschrijving van die API, om als tool in Foundry te plakken (dag 4)
 - `/stress`: stuurt snel verzoeken zonder retries om quota-limieten (HTTP 429) te laten zien
 - `/health`: health check (JSON)
 
