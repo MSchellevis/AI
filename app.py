@@ -1,12 +1,19 @@
-"""AI-lab chat-app (dag 2).
+"""AI-lab chat-app (dag 2 + dag 3).
 
 Een kleine Flask-app die een Foundry-model aanroept via de Responses API,
-met de managed identity van de web-app (geen API-sleutels).
+met de managed identity van de host (App Service of Container Apps). Geen API-sleutels.
+Dag 3 voegt RAG toe: de app zoekt eerst in een Azure AI Search-index (hybride +
+semantisch) en laat het model antwoorden op basis van die bronnen, met bronvermelding.
 
-App settings (Azure-portal > Web App > Settings > Environment variables):
-  AZURE_OPENAI_ENDPOINT  https://<foundry-resource>.openai.azure.com/openai/v1/
-  MODEL_DEPLOYMENTS      gpt-54-mini,gpt-54-nano   (deploymentnamen, komma-gescheiden)
-  TOKEN_SCOPE            (optioneel) standaard https://cognitiveservices.azure.com/.default
+Instellingen (App Service: Environment variables / Container Apps: Environment variables):
+  AZURE_OPENAI_ENDPOINT        https://<foundry-resource>.openai.azure.com/openai/v1/
+  MODEL_DEPLOYMENTS            gpt-54-mini,gpt-54-nano   (deploymentnamen, komma-gescheiden)
+  AZURE_SEARCH_ENDPOINT        https://<search-service>.search.windows.net   (dag 3)
+  AZURE_SEARCH_INDEX           beleid                                         (dag 3)
+  AZURE_SEARCH_SEMANTIC_CONFIG (optioneel) standaard <index>-semantic-configuration
+  RAG_TOP                      (optioneel) aantal bronnen, standaard 5
+  APP_VERSION                  (optioneel) label dat bovenin de pagina staat, bijv. v1 / v2
+  TOKEN_SCOPE                  (optioneel) standaard https://cognitiveservices.azure.com/.default
 """
 
 import os
@@ -122,6 +129,140 @@ def ask(deployment: str, prompt: str, instructions: str = "", effort: str = "sta
                 "seconds": round(time.perf_counter() - start, 2)}
 
 
+# ---------------------------------------------------------------- dag 3: RAG
+RAG_INSTRUCTIONS = (
+    "Je bent een assistent voor de (fictieve) gemeente Voorbeeldstad. Beantwoord de vraag "
+    "UITSLUITEND met de genummerde bronnen hieronder. Verwijs na elke bewering naar de bron "
+    "als [1], [2] enz. Staat het antwoord niet in de bronnen, zeg dan letterlijk: "
+    "'Dat staat niet in de documenten die ik kan raadplegen.' Verzin niets. Antwoord in het Nederlands."
+)
+
+
+def search_endpoint() -> str:
+    return os.environ.get("AZURE_SEARCH_ENDPOINT", "").strip().rstrip("/")
+
+
+def search_index() -> str:
+    return os.environ.get("AZURE_SEARCH_INDEX", "").strip()
+
+
+def semantic_config() -> str:
+    return os.environ.get("AZURE_SEARCH_SEMANTIC_CONFIG", "").strip() or f"{search_index()}-semantic-configuration"
+
+
+def rag_configured() -> bool:
+    return bool(search_endpoint() and search_index())
+
+
+def rag_top() -> int:
+    try:
+        return max(1, min(10, int(os.environ.get("RAG_TOP", "5"))))
+    except ValueError:
+        return 5
+
+
+_credential = None
+
+
+def credential():
+    """Dezelfde managed identity, nu voor Azure AI Search (scope https://search.azure.com)."""
+    global _credential
+    if _credential is None:
+        from azure.identity import DefaultAzureCredential
+        _credential = DefaultAzureCredential()
+    return _credential
+
+
+def get_search_client():
+    from azure.search.documents import SearchClient
+    return SearchClient(endpoint=search_endpoint(), index_name=search_index(), credential=credential())
+
+
+def explain_search_error(exc: Exception) -> dict:
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    if name in ("CredentialUnavailableError", "ClientAuthenticationError") and status is None:
+        hint = "Geen identiteit gevonden. Staat de managed identity van deze app aan?"
+    elif status in (401, 403):
+        hint = ("Geen toegang tot de zoekindex. Twee oorzaken: (1) de managed identity van deze app mist "
+                "de rol 'Search Index Data Reader' op de Search-service, of (2) de Search-service accepteert "
+                "alleen API-sleutels: zet Settings > Keys > API access control op 'Both' of 'Role-based access "
+                "control'. Na toekennen kan het tot 5-10 minuten duren.")
+    elif status == 404:
+        hint = "Index niet gevonden. Klopt AZURE_SEARCH_INDEX (de naam uit de Import data-wizard)?"
+    elif status == 400:
+        hint = ("Ongeldige zoekopdracht. Vaak een verkeerde naam van de semantische configuratie "
+                "(AZURE_SEARCH_SEMANTIC_CONFIG), een index zonder vectorizer, of een index die niet door de "
+                "Import data-wizard (RAG) is gemaakt: de app verwacht de velden title, chunk en text_vector.")
+    elif name in ("ServiceRequestError", "ServiceRequestTimeoutError"):
+        hint = "Search-endpoint onbereikbaar. Klopt AZURE_SEARCH_ENDPOINT (en het netwerk)?"
+    else:
+        hint = "Onverwachte fout bij het zoeken, zie de melding."
+    return {"type": name, "status": status, "retry_after": None, "hint": hint,
+            "message": str(exc)[:600], "stage": "zoeken (Azure AI Search)"}
+
+
+def retrieve(question: str, top: int = 5) -> dict:
+    """Hybride zoekopdracht (trefwoord + vector) met semantische herrangschikking.
+
+    De vector voor de vraag maakt Azure AI Search zelf (integrated vectorization): de app
+    stuurt alleen tekst. Mislukt de semantische stap (bijv. verkeerde configuratienaam),
+    dan valt de app terug op gewoon hybride zoeken en meldt dat.
+    """
+    from azure.search.documents.models import VectorizableTextQuery
+    start = time.perf_counter()
+    client = get_search_client()
+    vq = VectorizableTextQuery(text=question, k_nearest_neighbors=50, fields="text_vector")
+    base = dict(search_text=question, vector_queries=[vq], top=top,
+                select=["title", "chunk"])
+    mode = "hybride + semantisch"
+    try:
+        results = list(client.search(query_type="semantic",
+                                     semantic_configuration_name=semantic_config(), **base))
+    except Exception as exc:  # noqa: BLE001
+        if getattr(exc, "status_code", None) != 400:
+            raise
+        results = list(client.search(**base))
+        mode = "hybride (semantisch mislukt: controleer AZURE_SEARCH_SEMANTIC_CONFIG)"
+    sources = []
+    for i, r in enumerate(results, start=1):
+        sources.append({
+            "n": i,
+            "title": r.get("title") or "(zonder titel)",
+            "chunk": (r.get("chunk") or "").strip(),
+            "score": round(r.get("@search.score") or 0, 4),
+            "reranker": (round(r["@search.reranker_score"], 2)
+                         if r.get("@search.reranker_score") is not None else None),
+        })
+    return {"sources": sources, "mode": mode, "seconds": round(time.perf_counter() - start, 2)}
+
+
+def rag_answer(deployment: str, question: str, effort: str = "standaard") -> dict:
+    try:
+        found = retrieve(question, rag_top())
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": explain_search_error(exc), "seconds": 0}
+    if not found["sources"]:
+        return {"ok": True, "text": "Geen bronnen gevonden in de index. Is de indexer klaar en gevuld?",
+                "model": None, "usage": {}, "seconds": found["seconds"], "rag": found}
+    context = "\n\n".join(f"[{s['n']}] (bron: {s['title']})\n{s['chunk']}" for s in found["sources"])
+    prompt = f"Bronnen:\n{context}\n\nVraag: {question}"
+    result = ask(deployment, prompt, RAG_INSTRUCTIONS, effort)
+    result["rag"] = found
+    if result.get("ok"):
+        result["seconds"] = round(result["seconds"] + found["seconds"], 2)
+    return result
+
+
+def hosting() -> str:
+    if os.environ.get("CONTAINER_APP_NAME"):
+        rev = os.environ.get("CONTAINER_APP_REVISION", "?")
+        return f"Container Apps ({os.environ['CONTAINER_APP_NAME']}, revisie {rev})"
+    if os.environ.get("WEBSITE_SITE_NAME"):
+        return f"App Service ({os.environ['WEBSITE_SITE_NAME']})"
+    return "lokaal"
+
+
 PAGE = """<!doctype html>
 <html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI-lab chat</title>
@@ -136,10 +277,12 @@ PAGE = """<!doctype html>
  .answer{white-space:pre-wrap} .err{border-color:#d13438;background:#fdf3f4} table{border-collapse:collapse;width:100%}
  td,th{border-bottom:1px solid #edebe9;text-align:left;padding:6px 4px;font-size:.92rem} .muted{color:#605e5c;font-size:.9rem}
  code{background:#f3f2f1;padding:1px 4px;border-radius:3px}
+ .badge{background:#0067b8;color:#fff;border-radius:10px;padding:1px 9px;font-size:.8rem;margin-left:6px}
+ .src{border-left:3px solid #0067b8;padding:4px 10px;margin:8px 0;background:#f7f9fc} .src p{margin:4px 0;font-size:.88rem;white-space:pre-wrap}
 </style></head><body>
 <h1>AI-lab chat</h1>
-<p class="sub">App Service &rarr; managed identity &rarr; Foundry (Responses API). Geen sleutels.</p>
-<nav><a href="/">Chat</a><a href="/info">Info</a><a href="/stress">Rate-limit test</a></nav>
+<p class="sub">{{ host }} &rarr; managed identity &rarr; Foundry{% if rag_ok %} + AI Search{% endif %}. Geen sleutels. <span class="badge">{{ version }}</span></p>
+<nav><a href="/">Chat</a><a href="/info">Info</a><a href="/stress">Rate-limit test</a><a href="/health">Health</a></nav>
 {% if not configured %}
 <div class="card err"><b>Niet geconfigureerd.</b> Zet de app setting <code>AZURE_OPENAI_ENDPOINT</code> (en <code>MODEL_DEPLOYMENTS</code>).</div>
 {% endif %}
@@ -153,7 +296,11 @@ PAGE = """<!doctype html>
    <select id="deployment" name="deployment">{% for d in deps %}<option {% if d==deployment %}selected{% endif %}>{{ d }}</option>{% endfor %}</select></div>
   <div><label for="effort">Reasoning effort</label>
    <select id="effort" name="effort">{% for e in efforts %}<option {% if e==effort %}selected{% endif %}>{{ e }}</option>{% endfor %}</select></div>
+  <div><label for="source">Bron</label>
+   <select id="source" name="source"><option value="model" {% if bron=='model' %}selected{% endif %}>Alleen het model</option>
+   <option value="rag" {% if bron=='rag' %}selected{% endif %} {% if not rag_ok %}disabled{% endif %}>Mijn documenten (RAG){% if not rag_ok %} - niet ingesteld{% endif %}</option></select></div>
  </div>
+ {% if bron=='rag' %}<p class="muted">Bij RAG worden de instructies hierboven vervangen door vaste RAG-instructies: alleen antwoorden uit de bronnen, met [n]-verwijzingen.</p>{% endif %}
  <button type="submit">Verstuur</button>
 </form>
 {% if result %}
@@ -163,9 +310,15 @@ PAGE = """<!doctype html>
   <tr><th>Deployment</th><td>{{ deployment }}</td><th>Model (antwoord)</th><td>{{ result.model }}</td></tr>
   <tr><th>Tijd</th><td>{{ result.seconds }} s</td><th>Reasoning effort</th><td>{{ effort }}</td></tr>
   <tr><th>Input tokens</th><td>{{ result.usage.input }} (cached: {{ result.usage.cached }})</td><th>Output tokens</th><td>{{ result.usage.output }} (waarvan reasoning: {{ result.usage.reasoning }})</td></tr>
- </table><p class="muted">Reasoning tokens worden als output-tokens gerekend: ze kosten geld en tijd, ook al zie je ze niet.</p></div>
- {% else %}
- <div class="card err"><b>{{ result.error.type }}{% if result.error.status %} (HTTP {{ result.error.status }}){% endif %}</b>
+ </table><p class="muted">Reasoning tokens worden als output-tokens gerekend: ze kosten geld en tijd, ook al zie je ze niet.{% if result.rag %} Met RAG stijgen de input tokens: de bronnen gaan mee in de prompt.{% endif %}</p></div>
+ {% endif %}
+ {% if result.rag %}
+ <div class="card"><b>Bronnen uit de index</b> <span class="muted">({{ result.rag.sources|length }} stuks, {{ result.rag.mode }}, zoektijd {{ result.rag.seconds }} s)</span>
+  {% for s in result.rag.sources %}<div class="src"><b>[{{ s.n }}] {{ s.title }}</b> <span class="muted">score {{ s.score }}{% if s.reranker is not none %} &middot; semantisch {{ s.reranker }} (0-4){% endif %}</span>
+  <p>{{ s.chunk[:600] }}{% if s.chunk|length > 600 %}&hellip;{% endif %}</p></div>{% endfor %}</div>
+ {% endif %}
+ {% if not result.ok %}
+ <div class="card err"><b>{{ result.error.type }}{% if result.error.status %} (HTTP {{ result.error.status }}){% endif %}{% if result.error.stage %} bij {{ result.error.stage }}{% endif %}</b>
   <p>{{ result.error.hint }}</p>{% if result.error.retry_after %}<p>Retry-After: {{ result.error.retry_after }}</p>{% endif %}
   <p class="muted">{{ result.error.message }}</p></div>
  {% endif %}
@@ -202,11 +355,19 @@ def chat():
     effort = request.form.get("effort", "standaard")
     if effort not in EFFORTS:
         effort = "standaard"
+    source = request.form.get("source", "model")
+    if source not in ("model", "rag") or (source == "rag" and not rag_configured()):
+        source = "model"
     result = None
     if request.method == "POST" and prompt.strip() and deployment in deps:
-        result = ask(deployment, prompt.strip(), instructions.strip(), effort)
+        if source == "rag":
+            result = rag_answer(deployment, prompt.strip(), effort)
+        else:
+            result = ask(deployment, prompt.strip(), instructions.strip(), effort)
     return render_template_string(PAGE, deps=deps, instructions=instructions, prompt=prompt,
                                   deployment=deployment, effort=effort, efforts=EFFORTS,
+                                  bron=source, rag_ok=rag_configured(), host=hosting(),
+                                  version=os.environ.get("APP_VERSION", "v1"),
                                   result=result, configured=bool(endpoint()))
 
 
@@ -217,9 +378,13 @@ def info():
         ("Deployments", ", ".join(deployments())),
         ("Token scope", SCOPE),
         ("Managed identity actief", "ja" if os.environ.get("IDENTITY_ENDPOINT") else "nee (zet Identity aan)"),
-        ("Web-app", os.environ.get("WEBSITE_SITE_NAME", "(lokaal)")),
-        ("App Service SKU", os.environ.get("WEBSITE_SKU", "(onbekend)")),
-        ("Regio", os.environ.get("REGION_NAME", "(onbekend)")),
+        ("Hosting", hosting()),
+        ("APP_VERSION", os.environ.get("APP_VERSION", "v1")),
+        ("Container (replica)", os.environ.get("HOSTNAME", "(onbekend)") if os.environ.get("CONTAINER_APP_NAME") else "(n.v.t.)"),
+        ("App Service SKU", os.environ.get("WEBSITE_SKU", "(n.v.t.)")),
+        ("Search-endpoint", search_endpoint() or "(niet ingesteld)"),
+        ("Search-index", search_index() or "(niet ingesteld)"),
+        ("Semantische configuratie", semantic_config() if rag_configured() else "(n.v.t.)"),
         ("Ingelogde gebruiker (Easy Auth)", request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "(geen: authenticatie staat uit)")),
     ]
     return render_template_string(INFO, rows=rows)
@@ -246,7 +411,8 @@ def stress():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "configured": bool(endpoint())}
+    return {"status": "ok", "configured": bool(endpoint()), "rag": rag_configured(),
+            "version": os.environ.get("APP_VERSION", "v1"), "hosting": hosting()}
 
 
 if __name__ == "__main__":
