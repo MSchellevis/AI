@@ -8,6 +8,9 @@ configuratie, dus deze repo mag openbaar zijn.
 - **Dag 3**: RAG met Azure AI Search, en dezelfde code als container op Azure Container Apps.
 - **Dag 4**: pagina `/agent` die een prompt agent in Foundry Agent Service aanroept, en een kleine
   fictieve gemeente-API (`/api/...` + `/openapi.json`) die de agent als OpenAPI-tool gebruikt.
+- **Dag 5**: de gemeente-API vraagt header `x-api-key` zodra `GEMEENTE_API_KEY` is gezet (in Container Apps
+  als Key Vault-referentie), de app legt guardrail-blokkades (HTTP 400 `content_filter`) uit, en
+  testdossier `VBS-2026-0666` bevat een prompt injection om Prompt Shields op tool responses te testen.
 
 ## Instellingen (environment variables)
 
@@ -23,6 +26,8 @@ configuratie, dus deze repo mag openbaar zijn.
 | `FOUNDRY_PROJECT_ENDPOINT` | `https://<foundry>.services.ai.azure.com/api/projects/proj-ailab` | dag 4 |
 | `AGENT_NAME` | `voorbeeldstad-assistent` | dag 4 |
 | `PUBLIC_BASE_URL` | optioneel: publieke https-URL voor `/openapi.json` | dag 4 |
+| `GEMEENTE_API_KEY` | `secretref:gemeente-api-key` (Key Vault-referentie, nooit de waarde zelf in Git) | dag 5 |
+| `GEMEENTE_API_KEY_PREVIOUS` | optioneel: vorige sleutel, alleen tijdens een rotatie | dag 5 |
 
 ## Rechten voor de managed identity van de app
 
@@ -32,6 +37,7 @@ configuratie, dus deze repo mag openbaar zijn.
 | Search Index Data Reader | Search-service | de index doorzoeken (dag 3) |
 | AcrPull | Container registry | image ophalen (alleen Container Apps; zet het portal zelf) |
 | Foundry Agent Consumer | Foundry-project | de agent aanroepen (dag 4) |
+| Key Vault Secrets User | Key vault | de API-sleutel lezen via de Key Vault-referentie (dag 5) |
 
 ## Pagina's
 
@@ -47,8 +53,8 @@ configuratie, dus deze repo mag openbaar zijn.
 
 ```bash
 # In de cloud, zonder Docker (ACR Tasks):
-az acr build -r <acr-naam> -t ailab-chat:v1 .
+az acr build -r <acr-naam> -t ailab-chat:v5 .   # let op de punt
 # Met Docker (bijv. in GitHub Codespaces):
-docker build -t <acr-naam>.azurecr.io/ailab-chat:v1 . && docker push <acr-naam>.azurecr.io/ailab-chat:v1
+docker build -t <acr-naam>.azurecr.io/ailab-chat:v5 . && docker push <acr-naam>.azurecr.io/ailab-chat:v5
 ```
 De container luistert op poort **8000**.
